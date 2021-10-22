@@ -10,7 +10,52 @@ import torch
 import torch.distributed as dist
 from mmcv.image import tensor2imgs
 from mmcv.runner import get_dist_info
+from PIL import Image
+import cv2
+from pathlib import Path
+import matplotlib as mpl
 
+
+def detectManipulation(img, mask):
+    mask = cv2.resize(mask / mask.max(), img.size)[..., np.newaxis]*255
+    _, binary = cv2.threshold(mask, 0.70*np.max(mask), 255, cv2.THRESH_BINARY)
+    binary = cv2.dilate(binary, np.ones((9, 9),np.uint8), iterations = 2)
+
+    (contours, _) = cv2.findContours(binary.astype("uint8"), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(contours, key = cv2.contourArea)
+    img = np.array(img)
+    (x, y, w, h) = cv2.boundingRect(c)
+    cv2.rectangle(img, (x,y), (x+w,y+h), (255, 0, 0), 2)
+    return img
+
+def save_att_maps(img_show, filename, attention, out_dir):
+    Path(f"{out_dir}/attention_maps").mkdir(parents=True, exist_ok=True)
+
+    att_weights = torch.stack(attention).squeeze(1)
+    residual_att = torch.eye(att_weights.size(1)).to("cuda:0")
+    aug_att_mat = att_weights + residual_att
+    aug_att_mat = ((aug_att_mat / aug_att_mat.sum(dim=-1).unsqueeze(-1)).cpu().detach().numpy())
+    joint_attentions = np.zeros(aug_att_mat.shape)
+    joint_attentions[0] = aug_att_mat[0]
+
+    for n in range(1, aug_att_mat.shape[0]):
+        joint_attentions[n] = np.matmul(aug_att_mat[n], joint_attentions[n - 1])
+
+    v = joint_attentions[-1]
+    grid_size = int(np.sqrt(aug_att_mat.shape[-1]))
+    mask = v[0, 1:].reshape(grid_size, grid_size)
+    im = Image.open(filename)
+    img_name = filename.split("/")[-1]
+    detected_img = detectManipulation(Image.fromarray(img_show), mask)
+    
+    mask = cv2.resize(mask / mask.max(), im.size)
+    cm_hot = mpl.cm.get_cmap('jet')
+    color_mask = cm_hot(mask)
+    color_mask = np.uint8(color_mask * 255)
+    result_mask = cv2.addWeighted(color_mask[:, :, :3], 0.5, np.array(im), 0.5, 0).astype("uint8")
+    
+    Image.fromarray(result_mask).save(f"{out_dir}/attention_maps/att_map_{img_name}")
+    return detected_img, mask.flatten()
 
 def single_gpu_test(model,
                     data_loader,
@@ -19,11 +64,17 @@ def single_gpu_test(model,
                     **show_kwargs):
     model.eval()
     results = []
+    att_weights = []
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
+    masks = []
     for i, data in enumerate(data_loader):
+        att_weights = []
         with torch.no_grad():
             result = model(return_loss=False, **data)
+            if len(result) == 2:
+                result, attention = result
+                att_weights.extend(attention)
 
         batch_size = len(result)
         results.extend(result)
@@ -44,9 +95,13 @@ def single_gpu_test(model,
 
                 ori_h, ori_w = img_meta['ori_shape'][:-1]
                 img_show = mmcv.imresize(img_show, (ori_w, ori_h))
-
                 if out_dir:
-                    out_file = osp.join(out_dir, img_meta['ori_filename'])
+                    pred_dir = out_dir+"/test_predictions"
+                    out_file = osp.join(pred_dir, img_meta['ori_filename'])
+                    if att_weights != []:
+                        detected_img, mask = save_att_maps(img_show, img_meta['filename'], att_weights, out_dir)
+                        masks.append(mask)
+                        img_show = detected_img
                 else:
                     out_file = None
 
@@ -65,7 +120,7 @@ def single_gpu_test(model,
         batch_size = data['img'].size(0)
         for _ in range(batch_size):
             prog_bar.update()
-    return results
+    return results, masks
 
 
 def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
@@ -102,6 +157,8 @@ def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, **data)
+            if len(result) == 2:
+                result, _ = result
         if isinstance(result, list):
             results.extend(result)
         else:

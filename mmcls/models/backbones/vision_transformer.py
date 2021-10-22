@@ -160,14 +160,14 @@ class MultiheadAttention(nn.Module):
             query = query + query_pos
         if key_pos is not None:
             key = key + key_pos
-        out = self.attn(
+        out, weights = self.attn(
             query,
             key,
             value=value,
             attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask)[0]
+            key_padding_mask=key_padding_mask)
 
-        return residual + self.dropout(out)
+        return residual + self.dropout(out), weights
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -229,12 +229,12 @@ class TransformerEncoderLayer(nn.Module):
         # [num_query, batch_size, embed_dim]
         x = x.permute(1, 0, 2)
         norm_x = norm_x.permute(1, 0, 2)
-        x = self.attn(norm_x, residual=x)
+        x, weights = self.attn(norm_x, residual=x)
         # Convert the shape back to [batch_size, num_query, embed_dim] in
         # order to make use of the pretrained weight
         x = x.permute(1, 0, 2)
         x = self.mlp(self.norm2(x), residual=x)
-        return x
+        return x, weights
 
 
 class PatchEmbed(nn.Module):
@@ -473,8 +473,30 @@ class VisionTransformer(BaseBackbone):
         x = x + self.pos_embed
         x = self.drop_after_pos(x)
 
+        attention_weights = []
         for layer in self.layers:
-            x = layer(x)
+            x, weights = layer(x)
+            attention_weights.append(weights)
 
         x = self.norm1(x)[:, 0]
         return x
+
+@BACKBONES.register_module()
+class VisionTransformer2(VisionTransformer):
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(
+            B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.drop_after_pos(x)
+
+        attention_weights = []
+        for layer in self.layers:
+            x, weights = layer(x)
+            attention_weights.append(weights)
+
+        x = self.norm1(x)[:, 0]
+        return x, attention_weights

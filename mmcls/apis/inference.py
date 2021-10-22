@@ -81,12 +81,20 @@ def inference_model(model, img):
 
     # forward the model
     with torch.no_grad():
-        scores = model(return_loss=False, **data)
+        outputs = model(return_loss=False, **data)
+        if len(outputs) == 2:
+            scores, att_weights = outputs
+        else:
+            scores = outputs
+            att_weights = None
         pred_score = np.max(scores, axis=1)[0]
         pred_label = np.argmax(scores, axis=1)[0]
         result = {'pred_label': pred_label, 'pred_score': float(pred_score)}
     result['pred_class'] = model.CLASSES[result['pred_label']]
-    return result
+    if att_weights == None:
+        return result
+    else:
+         return result, att_weights
 
 
 def show_result_pyplot(model, img, result, fig_size=(15, 10)):

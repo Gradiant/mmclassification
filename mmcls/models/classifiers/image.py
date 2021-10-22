@@ -62,10 +62,18 @@ class ImageClassifier(BaseClassifier):
 
     def extract_feat(self, img):
         """Directly extract features from the backbone + neck."""
-        x = self.backbone(img)
+        outputs = self.backbone(img)
+        if len(outputs) == 2:
+            x, attention_weights = outputs
+        else:
+            x = outputs
+            attention_weights = None
         if self.with_neck:
             x = self.neck(x)
-        return x
+        if attention_weights is None:
+            return x
+        else:
+            return x, attention_weights
 
     def forward_train(self, img, gt_label, **kwargs):
         """Forward computation during training.
@@ -84,7 +92,8 @@ class ImageClassifier(BaseClassifier):
             img, gt_label = self.augments(img, gt_label)
 
         x = self.extract_feat(img)
-
+        if len(x) == 2:
+            x, _ = x
         losses = dict()
         loss = self.head.forward_train(x, gt_label)
         losses.update(loss)
@@ -94,7 +103,18 @@ class ImageClassifier(BaseClassifier):
     def simple_test(self, img, img_metas):
         """Test without augmentation."""
         x = self.extract_feat(img)
+        if len(x) == 2:
+            x, att_weights = x
+        else:
+            x = x
+            att_weights = None
         x_dims = len(x.shape)
         if x_dims == 1:
             x.unsqueeze_(0)
-        return self.head.simple_test(x)
+
+        if att_weights is None:
+            return self.head.simple_test(x)
+        else:
+            return self.head.simple_test(x), att_weights
+        
+        
